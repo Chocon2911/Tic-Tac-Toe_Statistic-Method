@@ -1,0 +1,179 @@
+% This is a sample paper template for CS331 Assignment
+% Using LLNCS macro package for Springer Computer Science proceedings
+% Version 2.20 of 2017/10/04
+
+\documentclass[runningheads]{llncs}
+
+\usepackage{graphicx}
+\usepackage{cite}
+\usepackage[T1]{fontenc}
+\usepackage{url}
+\usepackage{booktabs}  
+\usepackage{amsfonts}  
+\usepackage{nicefrac} 
+\usepackage{microtype}
+\usepackage{lipsum}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage{floatrow}
+\usepackage{gensymb}
+\usepackage{tabularray}
+\usepackage{float}
+\usepackage{soul}
+\usepackage[ruled]{algorithm2e}
+\usepackage{subcaption}
+\floatsetup[table]{capposition=above}
+\captionsetup[table]{labelfont=bf}
+\setlength{\intextsep}{5pt plus 2pt minus 2pt}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}}
+
+% If you use the hyperref package, please uncomment the following line
+% to display URLs in blue roman font according to Springer's eBook style:
+% \renewcommand\UrlFont{\color{blue}\rmfamily}
+
+\begin{document}
+
+\title{Efficient Generation and Analysis of Terminal Tic-Tac-Toe Positions on a 5×5 Board}
+
+\author{Nguyen Dinh Khiem\inst{1}}
+\authorrunning{Khiem}
+\titlerunning{5×5 Tic-Tac-Toe Dataset Generation}
+
+\institute{
+\email{Khiem.ND227983@sis.hust.edu.vn} \\
+Troy University \\
+Lecturer: Assoc. Prof. Van Hai Pham \\ \email{haipv@soict.hust.edu.vn} \\
+}
+
+\maketitle
+
+\begin{abstract}
+This paper presents a novel approach to generating and analyzing terminal positions in 5×5 Tic-Tac-Toe games. We introduce an efficient method for constructing a comprehensive dataset of legal terminal positions, leveraging board symmetries for deduplication and employing a compact binary encoding format. Our approach uses reverse generation from winning lines, coupled with rigorous legality validation and canonical form representation, to create a complete corpus of terminal game states. The methodology ensures completeness while maintaining practical computational requirements through symmetry-aware optimizations and streaming data management. The resulting dataset provides valuable insights into game characteristics and serves as a foundation for further analysis of advanced Tic-Tac-Toe variants.
+\end{abstract}
+
+\keywords{Tic-Tac-Toe \and Game Analysis \and Combinatorial Games \and Symmetry Optimization \and Dataset Generation}
+
+\section{Introduction}
+\label{sec:intro}
+
+Tic-Tac-Toe, despite its simple rules, presents interesting computational challenges when scaled to larger board sizes. This paper focuses on the 5×5 variant with a win condition of five-in-a-row, exploring methods to efficiently generate and analyze all possible terminal game states.
+
+Our research addresses several key challenges:
+
+\begin{itemize}
+    \item Generation of all legal terminal positions from an empty board
+    \item Efficient handling of board symmetries to eliminate duplicates
+    \item Validation of game state legality and reachability
+    \item Compact representation and storage of the dataset
+\end{itemize}
+
+The significance of this work lies in both its methodological contributions to game state analysis and its practical applications in game theory and artificial intelligence research.
+
+\section{Related Work}
+\label{sec:related}
+
+While extensive research exists on standard 3×3 Tic-Tac-Toe and its variants, systematic analysis of larger board sizes has been limited by computational complexity. Previous work has primarily focused on forward game tree exploration, which becomes intractable for 5×5 boards due to the exponential growth in possible states.
+
+Our approach builds upon:
+\begin{itemize}
+    \item Symmetry reduction techniques in combinatorial game theory
+    \item Efficient board state encoding methods
+    \item Reverse game state construction strategies
+\end{itemize}
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Reverse Generation Approach}
+\label{subsec:reverse}
+
+Instead of exploring the forward game tree, we construct terminal states directly by working backwards from winning configurations. The process involves:
+
+\begin{enumerate}
+    \item Identifying geometric winning lines (5 contiguous cells)
+    \item Selecting winner and feasible total ply count
+    \item Placing winning marks and distributing remaining pieces
+    \item Validating board state legality
+\end{enumerate}
+
+\subsection{Symmetry Optimization}
+\label{subsec:symmetry}
+
+We leverage the D4 symmetry group of the square board, comprising:
+\begin{itemize}
+    \item 4 rotations (0°, 90°, 180°, 270°)
+    \item 4 reflections (horizontal, vertical, main diagonal, anti-diagonal)
+\end{itemize}
+
+This reduces the search space by identifying and storing only canonical representatives of equivalent positions.
+
+\subsection{Data Encoding and Storage}
+\label{subsec:encoding}
+
+Our binary encoding scheme achieves efficient storage:
+\begin{itemize}
+    \item 2 bits per cell (00=empty, 01=X, 10=O)
+    \item 25 cells → 50 bits total
+    \item Packed into 64-bit words for alignment
+\end{itemize}
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Dataset Characteristics}
+The generated dataset exhibits several notable patterns:
+
+\begin{itemize}
+    \item Minimum ply counts: 9 for X wins, 10 for O wins
+    \item Mid-game positions show highest diversity
+    \item Late-game positions constrained by board filling
+\end{itemize}
+
+\subsection{Performance Analysis}
+The approach demonstrates efficient resource utilization:
+
+\begin{itemize}
+    \item Streaming processing reduces memory requirements
+    \item Symmetry optimization significantly reduces storage needs
+    \item Parallelizable across different winning lines and plies
+\end{itemize}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Advantages}
+\begin{itemize}
+    \item Complete coverage of terminal positions
+    \item Efficient storage through symmetry reduction
+    \item Scalable processing through streaming
+\end{itemize}
+
+\subsection{Limitations}
+\begin{itemize}
+    \item Winner/ply information implicit in layer structure
+    \item Single-threaded generation bottlenecks
+    \item Limited to geometric symmetry deduplication
+\end{itemize}
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented an efficient methodology for generating and analyzing terminal positions in 5×5 Tic-Tac-Toe. Our approach combines reverse generation, symmetry optimization, and compact encoding to create a comprehensive dataset of terminal game states. The resulting corpus provides a valuable resource for game analysis and AI research.
+
+Future work could include:
+\begin{itemize}
+    \item Extension to larger board sizes
+    \item Parallel processing optimizations
+    \item Integration of semantic equivalence analysis
+    \item Enhanced metadata storage
+\end{itemize}
+
+% Bibliography
+\bibliographystyle{splncs04}
+\bibliography{ref}
+
+\end{document}

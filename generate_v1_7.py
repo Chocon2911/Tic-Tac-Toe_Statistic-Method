@@ -1,6 +1,7 @@
-import csv
 import itertools
 import time
+import struct
+import csv
 from typing import List, Tuple, Iterable, Set
 
 # ----- Board basics -----
@@ -68,23 +69,6 @@ def line_positions_from_mask(mask: List[int]) -> Tuple[int,...]:
         raise ValueError("A base mask must contain either all 1s or all 2s (not mixed).")
     return tuple(sorted(idxs))
 
-def apply_transform_to_indices(idxs: Tuple[int,...], T) -> Tuple[int,...]:
-    out = []
-    for i in idxs:
-        r,c = i_to_rc(i)
-        r2,c2 = T(r,c)
-        out.append(rc_to_i(r2,c2))
-    return tuple(sorted(out))
-
-def expand_lines_via_symmetry(base_masks: List[List[int]]) -> List[Tuple[int,...]]:
-    """Unique geometric winning lines from base masks using all symmetries."""
-    lines = set()
-    for m in base_masks:
-        base_idxs = line_positions_from_mask(m)
-        for T in TRANSFORMS:
-            lines.add(apply_transform_to_indices(base_idxs, T))
-    return sorted(lines)  # expect 10 lines on 4x4
-
 # ----- Win/validation helpers -----
 def has_winner(board: List[int], player: int, win_lines: List[Tuple[int,...]]) -> bool:
     return any(all(board[i] == player for i in line) for line in win_lines)
@@ -105,26 +89,26 @@ def ply(board: List[int]) -> int:
 
 def valid_turn_counts(board: List[int], win_lines: List[Tuple[int,...]]) -> bool:
     x, o = count_pieces(board)
-    if not (x == o or x == o + 1):                 # X first
+    if not (x == o or x == o + 1):
         return False
-    if has_winner(board, 2, win_lines) and x != o:     # O wins → even ply
+    if has_winner(board, 2, win_lines) and x != o:
         return False
-    if has_winner(board, 1, win_lines) and x != o + 1: # X wins → odd ply
+    if has_winner(board, 1, win_lines) and x != o + 1:
         return False
     return True
 
 def min_ply_ok(board: List[int], win_lines: List[Tuple[int,...]]) -> bool:
     x, o = count_pieces(board)
-    if has_winner(board, 1, win_lines) and (2 * x - 1) < 7:  # X's 4th move
+    if has_winner(board, 1, win_lines) and (2 * x - 1) < 7:
         return False
-    if has_winner(board, 2, win_lines) and (2 * o) < 8:      # O's 4th move
+    if has_winner(board, 2, win_lines) and (2 * o) < 8:
         return False
     return True
 
 def is_terminal_reachable(board: List[int], winner: int, win_lines: List[Tuple[int,...]]) -> bool:
     """
     Exactly one winner. There exists a last-move on a winning line such that
-    removing it yields a legal previous position: correct counts, no winner, turn rule holds.
+    removing it yields a legal previous position.
     """
     if winner not in (1,2): return False
     if winners(board, win_lines) != {winner}: return False
@@ -155,14 +139,12 @@ def is_terminal_reachable(board: List[int], winner: int, win_lines: List[Tuple[i
                 return True
     return False
 
-# ----- Exhaustive (deterministic) enumeration -----
+# ----- Exhaustive enumeration -----
 def enumerate_wins_for_line(line: Tuple[int,...], winner: int, win_lines: List[Tuple[int,...]]) -> Iterable[List[int]]:
     """All terminal, reachable boards where 'winner' wins on 'line'."""
     if winner == 1:
-        # Odd plies: 7..15
         ply_values = range(7, 16, 2)
     else:
-        # Even plies: 8..16
         ply_values = range(8, 17, 2)
 
     for T in ply_values:
@@ -203,21 +185,101 @@ def enumerate_wins_for_line(line: Tuple[int,...], winner: int, win_lines: List[T
                     continue
                 if not is_terminal_reachable(b, winner, win_lines):
                     continue
-
                 yield b
 
-# ----- Compact board representation -----
-def board_to_compact(board: List[int]) -> str:
-    """Convert board to compact string format: - for empty, X for 1, O for 2"""
-    return ''.join('-' if v == 0 else 'X' if v == 1 else 'O' for v in board)
+# # ----- Binary encoding/decoding (COMMENTED OUT) -----
+# def board_to_bits(board: List[int]) -> int:
+#     """Encode board as 32-bit integer using 2 bits per cell."""
+#     result = 0
+#     for i, val in enumerate(board):
+#         result |= (val << (i * 2))
+#     return result
 
-# ----- I/O -----
-def write_compact_csv(path: str, rows: List[Tuple[str, int, int]]):
-    """Write CSV with compact board format (no commas in board string)"""
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["board", "winner", "ply"])
-        w.writerows(rows)
+# def bits_to_board(bits: int) -> List[int]:
+#     """Decode 32-bit integer back to board."""
+#     board = []
+#     for i in range(SIZE):
+#         board.append((bits >> (i * 2)) & 3)
+#     return board
+
+# def encode_record(board: List[int], winner: int, ply_count: int) -> bytes:
+#     """Encode a single record as 5 bytes."""
+#     board_bits = board_to_bits(board)
+#     metadata = ((winner & 0xF) << 4) | (ply_count & 0xF)
+#     return struct.pack('<IB', board_bits, metadata)
+
+# def decode_record(data: bytes) -> Tuple[List[int], int, int]:
+#     """Decode 5-byte record back to board, winner, ply."""
+#     board_bits, metadata = struct.unpack('<IB', data)
+#     board = bits_to_board(board_bits)
+#     winner = (metadata >> 4) & 0xF
+#     ply_count = metadata & 0xF
+#     return board, winner, ply_count
+
+# # ----- Binary I/O (COMMENTED OUT) -----
+# def write_binary_dataset(path: str, records: List[Tuple[List[int], int, int]]):
+#     """Write binary dataset with header."""
+#     MAGIC = 0x54545434  # "TTT4"
+#     RECORD_SIZE = 5
+    
+#     with open(path, 'wb') as f:
+#         f.write(struct.pack('<III', MAGIC, len(records), RECORD_SIZE))
+#         for board, winner, ply_count in records:
+#             f.write(encode_record(board, winner, ply_count))
+
+# def read_binary_dataset(path: str) -> List[Tuple[List[int], int, int]]:
+#     """Read binary dataset."""
+#     with open(path, 'rb') as f:
+#         magic, count, record_size = struct.unpack('<III', f.read(12))
+#         if magic != 0x54545434:
+#             raise ValueError(f"Invalid magic number: {hex(magic)}")
+#         if record_size != 5:
+#             raise ValueError(f"Unexpected record size: {record_size}")
+        
+#         records = []
+#         for _ in range(count):
+#             data = f.read(record_size)
+#             records.append(decode_record(data))
+#         return records
+
+# ----- CSV I/O -----
+def write_csv_dataset(path: str, records: List[Tuple[List[int], int, int]]):
+    """Write dataset to CSV file."""
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        
+        # Write header
+        cell_headers = [f'cell_{i}' for i in range(SIZE)]
+        writer.writerow(cell_headers + ['winner', 'ply'])
+        
+        # Write data
+        for board, winner, ply_count in records:
+            writer.writerow(board + [winner, ply_count])
+
+def read_csv_dataset(path: str) -> List[Tuple[List[int], int, int]]:
+    """Read dataset from CSV file."""
+    records = []
+    with open(path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+        
+        for row in reader:
+            board = [int(x) for x in row[:SIZE]]
+            winner = int(row[SIZE])
+            ply_count = int(row[SIZE + 1])
+            records.append((board, winner, ply_count))
+    
+    return records
+
+# ----- Utility functions -----
+def format_size(bytes_count: int) -> str:
+    """Format byte count into readable string."""
+    if bytes_count < 1024:
+        return f"{bytes_count} bytes"
+    elif bytes_count < 1024 * 1024:
+        return f"{bytes_count / 1024:.2f} KB"
+    else:
+        return f"{bytes_count / (1024 * 1024):.2f} MB"
 
 def format_time(seconds: float) -> str:
     """Format seconds into readable time string."""
@@ -233,15 +295,16 @@ def format_time(seconds: float) -> str:
         secs = seconds % 60
         return f"{hours}h {mins}m {secs:.2f}s"
 
-# ----- Main (symmetric-only) with timing -----
-def generate_dataset_symmetric_only(
+# ----- Main (CSV output) -----
+def generate_dataset_csv(
     base_path: str = "base_dataset.csv",
     out_path: str = "tictactoe4x4_dataset.csv"
 ) -> None:
     overall_start = time.time()
     
     print("="*60)
-    print("4x4 TIC-TAC-TOE DATASET GENERATOR (COMPACT FORMAT)")
+    print("4x4 TIC-TAC-TOE DATASET GENERATOR")
+    print("(CSV Format - Unique canonical forms only)")
     print("="*60)
     
     # Read base masks
@@ -251,35 +314,32 @@ def generate_dataset_symmetric_only(
     step_time = time.time() - step_start
     print(f"  ✓ Loaded {len(base_masks)} base masks in {format_time(step_time)}")
     
-    # Expand lines via symmetry
-    print(f"\n[2/3] Expanding winning lines via symmetry...")
+    # Extract winning lines directly from base masks (no expansion)
+    print(f"\n[2/3] Extracting base winning lines...")
     step_start = time.time()
-    win_lines = expand_lines_via_symmetry(base_masks)
+    win_lines = [line_positions_from_mask(m) for m in base_masks]
     step_time = time.time() - step_start
-    print(f"  ✓ Generated {len(win_lines)} unique winning lines in {format_time(step_time)}")
+    print(f"  ✓ Using {len(win_lines)} base winning lines in {format_time(step_time)}")
     
     # Generate all boards
     print(f"\n[3/3] Generating terminal boards...")
     step_start = time.time()
     
     seen = set()
-    rows: List[Tuple[str, int, int]] = []
-    total_combinations = len(win_lines) * 2  # 10 lines × 2 winners
+    records: List[Tuple[List[int], int, int]] = []
     
     for idx, line in enumerate(win_lines, 1):
         line_start = time.time()
         line_boards = 0
         
         for winner in (1, 2):
-            combo_num = (idx - 1) * 2 + winner
             for b in enumerate_wins_for_line(line, winner, win_lines):
                 cb = canonical_board(b)
                 key = (cb, winner)
                 if key in seen:
                     continue
                 seen.add(key)
-                compact_board = board_to_compact(cb)
-                rows.append((compact_board, winner, ply(b)))
+                records.append((list(cb), winner, ply(b)))
                 line_boards += 1
         
         line_time = time.time() - line_start
@@ -287,34 +347,65 @@ def generate_dataset_symmetric_only(
         progress = (idx / len(win_lines)) * 100
         
         print(f"  Line {idx}/{len(win_lines)} [{progress:5.1f}%]: "
-              f"+{line_boards} boards ({len(rows)} total) | "
+              f"+{line_boards} boards ({len(records)} total) | "
               f"{format_time(line_time)} | "
               f"Elapsed: {format_time(elapsed)}")
     
     step_time = time.time() - step_start
-    print(f"  ✓ Generated {len(rows)} unique boards in {format_time(step_time)}")
+    print(f"  ✓ Generated {len(records)} unique canonical boards in {format_time(step_time)}")
     
     # Write output
-    print(f"\n[4/4] Writing results to '{out_path}'...")
+    print(f"\n[4/4] Writing CSV dataset to '{out_path}'...")
     write_start = time.time()
-    write_compact_csv(out_path, rows)
+    write_csv_dataset(out_path, records)
     write_time = time.time() - write_start
+    
+    import os
+    file_size = os.path.getsize(out_path)
     print(f"  ✓ File written in {format_time(write_time)}")
+    print(f"  ✓ File size: {format_size(file_size)}")
     
     # Summary
     total_time = time.time() - overall_start
     print("\n" + "="*60)
     print("GENERATION COMPLETE")
     print("="*60)
-    print(f"Total unique boards: {len(rows)}")
+    print(f"Total unique canonical boards: {len(records)}")
+    print(f"File size: {format_size(file_size)}")
     print(f"Total time: {format_time(total_time)}")
-    print(f"Average time per board: {(total_time/len(rows)*1000):.2f}ms")
-    print(f"\nOutput format: board (16 chars), winner (1=X, 2=O), ply")
-    print(f"Board encoding: - = empty, X = player 1, O = player 2")
+    print(f"Average time per board: {(total_time/len(records)*1000):.2f}ms")
+    print(f"\nNote: Symmetry can be applied during search/lookup")
+    print(f"Each canonical board represents up to 8 symmetric variants")
     print("="*60 + "\n")
 
+# ----- Demo reading -----
+def demo_read_csv(path: str = "tictactoe4x4_dataset.csv", num_samples: int = 5):
+    """Demonstrate reading the CSV dataset."""
+    print(f"\n{'='*60}")
+    print("READING CSV DATASET")
+    print('='*60)
+    
+    records = read_csv_dataset(path)
+    print(f"Loaded {len(records)} records\n")
+    
+    print(f"First {num_samples} records:")
+    for i, (board, winner, ply_count) in enumerate(records[:num_samples]):
+        print(f"\nRecord {i+1}:")
+        for row in range(N):
+            line = ""
+            for col in range(N):
+                val = board[row * N + col]
+                line += ['-', 'X', 'O'][val] + " "
+            print(f"  {line}")
+        print(f"  Winner: {'X' if winner == 1 else 'O'}, Ply: {ply_count}")
+    
+    print('='*60)
+
 if __name__ == "__main__":
-    generate_dataset_symmetric_only(
+    generate_dataset_csv(
         base_path="base_dataset.csv",
         out_path="tictactoe4x4_dataset.csv"
     )
+    
+    # Optionally demo reading
+    # demo_read_csv("tictactoe4x4_dataset.csv")

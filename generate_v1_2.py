@@ -4,7 +4,7 @@ import struct
 from typing import List, Tuple, Iterable, Set
 
 # ----- Board basics -----
-N = 4
+N = 3
 SIZE = N * N
 ALL_CELLS = tuple(range(SIZE))
 
