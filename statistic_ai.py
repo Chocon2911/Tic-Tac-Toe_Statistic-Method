@@ -4,714 +4,557 @@ import copy
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-#=========================================Data Type==========================================
-class Position:
-    def __init__(self, i: int, j: int, val: str):
-        """
-        i, j: 1-indexed row, column
-        val: 'X', 'O', ... hoặc bất kỳ ký tự nào
-        """
-        self.i = i
-        self.j = j
-        self.val = val
-
-class Board:
-    def __init__(self, positions: list, size: int = 5, layer: int = 0, win_actor: str = ''):
-        """
-        positions: list of Position objects
-        size: kích thước bàn cờ (default 5x5)
-        layer: lớp hiện tại (số nước đã đi)
-        win_actor: người thắng ('X', 'O', '' nếu chưa kết thúc hoặc hòa)
-        """
-        self.size = size
-        self.positions = positions
-        self.layer = layer
-        self.win_actor = win_actor
-        self.board = np.full((size, size), '.', dtype=str)  # ô trống là '.'
-        for pos in self.positions:
-            self.board[pos.i-1, pos.j-1] = pos.val  # chuyển 1-index → 0-index
-
-    def canonical_form(self) -> 'Board':
-        """
-        Trả về Board ở dạng canonical (xoay/flip tối ưu hóa đối xứng)
-        """
-        boards = []
-
-        for k in range(4):  # rotate 0, 90, 180, 270
-            rot = np.rot90(self.board, k)
-            boards.append(rot)
-            boards.append(np.fliplr(rot))  # flip ngang
-            boards.append(np.flipud(rot))  # flip dọc
-
-        # Chuyển tất cả biến thể thành string row-major
-        board_strings = [''.join(b.flatten()) for b in boards]
-
-        # Chọn canonical form: string nhỏ nhất theo lex order
-        min_string = min(board_strings)
-        min_index = board_strings.index(min_string)
-        
-        # Lấy numpy array tương ứng
-        canonical_array = boards[min_index]
-        
-        # Tạo danh sách Position từ canonical array
-        canonical_positions = []
-        for i in range(self.size):
-            for j in range(self.size):
-                if canonical_array[i, j] != '.':
-                    canonical_positions.append(
-                        Position(i+1, j+1, canonical_array[i, j])
-                    )
-        
-        # Trả về Board mới với canonical positions
-        return Board(canonical_positions, self.size, self.layer, self.win_actor)
-    
-    def add_pos(self, pos: Position):
-        """
-        Thêm một Position vào board
-        """
-        self.positions.append(pos)
-        self.board[pos.i-1, pos.j-1] = pos.val
-        self.layer += 1
-
-    def check_win(self) -> str:
-        """
-        Kiểm tra ai thắng trên board hiện tại
-        Trả về 'X', 'O', hoặc '' (chưa có người thắng)
-        """
-        # Kiểm tra hàng ngang
-        for i in range(self.size):
-            for j in range(self.size - 4):
-                if self.board[i, j] != '.' and \
-                   all(self.board[i, j+k] == self.board[i, j] for k in range(5)):
-                    return self.board[i, j]
-        
-        # Kiểm tra hàng dọc
-        for i in range(self.size - 4):
-            for j in range(self.size):
-                if self.board[i, j] != '.' and \
-                   all(self.board[i+k, j] == self.board[i, j] for k in range(5)):
-                    return self.board[i, j]
-        
-        # Kiểm tra đường chéo chính (\)
-        for i in range(self.size - 4):
-            for j in range(self.size - 4):
-                if self.board[i, j] != '.' and \
-                   all(self.board[i+k, j+k] == self.board[i, j] for k in range(5)):
-                    return self.board[i, j]
-        
-        # Kiểm tra đường chéo phụ (/)
-        for i in range(4, self.size):
-            for j in range(self.size - 4):
-                if self.board[i, j] != '.' and \
-                   all(self.board[i-k, j+k] == self.board[i, j] for k in range(5)):
-                    return self.board[i, j]
-        
-        return ''
-
-    def is_full(self) -> bool:
-        """Kiểm tra bàn cờ đã đầy chưa"""
-        return not np.any(self.board == '.')
-
-    def __str__(self):
-        board_str = "  " + " ".join(str(i+1) for i in range(self.size)) + "\n"
-        for i in range(self.size):
-            board_str += str(i+1) + " " + " ".join(self.board[i]) + "\n"
-        if self.win_actor:
-            board_str += f"Winner: {self.win_actor}\n"
-        return board_str
-
-#==========================================Database==========================================
+#==========================================Database Configuration==========================================
 CLICKHOUSE_HTTP = "http://localhost:8123"
 CLICKHOUSE_USER = "default"
 CLICKHOUSE_PASS = "admin"
 DATABASE = "tictactoe"
 
-# ✅ Connection pooling
+# Connection pooling
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100,
-    pool_maxsize=100,
-    max_retries=3
+    pool_connections=50,
+    pool_maxsize=50,
+    max_retries=2
 )
 session.mount('http://', adapter)
 
-# ✅ Query cache
-QUERY_CACHE = {}
-MAX_CACHE_SIZE = 10000
 
-def query_by_positions_optimized(table: str, positions: list):
+def execute_query(sql: str) -> int:
     """
-    Truy xuất từ ClickHouse với tối ưu hóa:
-    - Chỉ SELECT 2 columns cần thiết
-    - Sử dụng connection pooling
-    """
-    if not positions:
-        raise ValueError("positions không được rỗng")
-
-    # Cache key
-    cache_key = (table, tuple(sorted([(p['i'] if isinstance(p, dict) else p[0], 
-                                       p['j'] if isinstance(p, dict) else p[1]) 
-                                      for p in positions])))
-    
-    if cache_key in QUERY_CACHE:
-        return QUERY_CACHE[cache_key]
-
-    # Chuyển danh sách thành điều kiện WHERE
-    conditions = []
-    for pos in positions:
-        if isinstance(pos, dict):
-            i, j = pos['i'], pos['j']
-        else:  # tuple/list
-            i, j = pos
-        col_name = f"i{i}{j}"
-        conditions.append(f"{col_name} != ''")
-    where_clause = " AND ".join(conditions)
-
-    # ✅ Chỉ SELECT 2 columns cần thiết
-    sql = f"SELECT canonical_form, win_actor FROM {DATABASE}.{table} WHERE {where_clause}"
-
-    response = session.post(  # ✅ Dùng session pool
-        CLICKHOUSE_HTTP,
-        params={
-            "user": CLICKHOUSE_USER,
-            "password": CLICKHOUSE_PASS,
-        },
-        data=sql,
-        timeout=5
-    )
-
-    if response.status_code != 200:
-        return []
-
-    if not response.text.strip():
-        return []
-
-    # Parse TSV
-    rows = response.text.strip().split("\n")
-    data = [row.split("\t") for row in rows]
-    
-    # Cache result
-    if len(QUERY_CACHE) < MAX_CACHE_SIZE:
-        QUERY_CACHE[cache_key] = data
-    
-    return data
-
-
-def batch_query_parallel(table: str, conditions_list: list, max_workers: int = 30):
-    """
-    Query song song nhiều conditions
+    Thực thi SQL query và trả về COUNT
     
     Args:
-        table: Tên bảng
-        conditions_list: List các conditions [[{i,j},...], [{i,j},...]]
-        max_workers: Số thread song song
-    
+        sql: SQL query string
+        
     Returns:
-        List kết quả tương ứng với từng condition
+        Số lượng rows (int)
     """
-    results = [None] * len(conditions_list)
-    
-    def query_one(index, conditions):
-        try:
-            return index, query_by_positions_optimized(table, conditions)
-        except Exception as e:
-            return index, []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(query_one, i, cond): i 
-            for i, cond in enumerate(conditions_list)
-        }
-        
-        for future in as_completed(futures):
-            index, result = future.result()
-            results[index] = result
-    
-    return results
-
-#=======================================Transformation=======================================
-def get_transform_mapping(original_board: Board, canonical_board: Board) -> dict:
-    """
-    Tìm transformation từ original board sang canonical board.
-    Trả về dict chứa thông tin transformation.
-    """
-    size = original_board.size
-    
-    # Thử tất cả các transformation
-    transformations = []
-    for k in range(4):  # rotate 0, 90, 180, 270
-        rot = np.rot90(original_board.board, k)
-        transformations.append(('rot', k, rot))
-        transformations.append(('rot_fliplr', k, np.fliplr(rot)))
-        transformations.append(('rot_flipud', k, np.flipud(rot)))
-    
-    # Tìm transformation khớp với canonical
-    for trans_type, rotation, transformed in transformations:
-        if np.array_equal(transformed, canonical_board.board):
-            return {
-                'type': trans_type,
-                'rotation': rotation,
-                'size': size
-            }
-    
-    # Nếu không tìm thấy, trả về identity
-    return {'type': 'identity', 'rotation': 0, 'size': size}
-
-
-def reverse_transform(canonical_pos: tuple, transform_map: dict, size: int) -> tuple:
-    """
-    Map position từ canonical board về original board.
-    
-    Args:
-        canonical_pos: (i, j) trên canonical board (1-indexed)
-        transform_map: Dict chứa thông tin transformation
-        size: Kích thước board
-    
-    Returns:
-        (i, j) trên original board (1-indexed)
-    """
-    if transform_map['type'] == 'identity':
-        return canonical_pos
-    
-    i, j = canonical_pos[0] - 1, canonical_pos[1] - 1  # Chuyển về 0-indexed
-    
-    # Tạo ma trận test
-    test_board = np.full((size, size), '.', dtype=str)
-    test_board[i, j] = 'T'  # Đánh dấu vị trí
-    
-    trans_type = transform_map['type']
-    rotation = transform_map['rotation']
-    
-    # Apply transformation ngược
-    if trans_type == 'rot_flipud':
-        test_board = np.flipud(test_board)
-    elif trans_type == 'rot_fliplr':
-        test_board = np.fliplr(test_board)
-    
-    # Rotate ngược (4-k rotations)
-    test_board = np.rot90(test_board, 4 - rotation)
-    
-    # Tìm vị trí 'T' trong board gốc
-    pos = np.where(test_board == 'T')
-    if len(pos[0]) > 0:
-        return (pos[0][0] + 1, pos[1][0] + 1)  # Chuyển về 1-indexed
-    
-    return canonical_pos  # Fallback
-
-#========================================Heuristic=========================================
-def get_board_score(board: Board, player: str) -> float:
-    """Heuristic scoring cho board"""
-    score = 0.0
-    opponent = 'O' if player == 'X' else 'X'
-    
-    # Đếm sequences
-    for length in [4, 3, 2]:
-        player_seq = count_sequences(board, player, length)
-        opponent_seq = count_sequences(board, opponent, length)
-        
-        score += player_seq * (length ** 3)
-        score -= opponent_seq * (length ** 2)
-    
-    return score
-
-
-def count_sequences(board: Board, player: str, length: int) -> int:
-    """Đếm số sequences có độ dài length"""
-    count = 0
-    size = board.size
-    
-    # Ngang
-    for i in range(size):
-        for j in range(size - length + 1):
-            seq = [board.board[i, j+k] for k in range(length)]
-            if seq.count(player) == length and '.' not in seq:
-                count += 1
-    
-    # Dọc
-    for i in range(size - length + 1):
-        for j in range(size):
-            seq = [board.board[i+k, j] for k in range(length)]
-            if seq.count(player) == length and '.' not in seq:
-                count += 1
-    
-    return count
-
-#==========================================AI Logic==========================================
-def next_best_move(board: Board, player: str) -> tuple:
-    """
-    Tính nước đi tốt nhất tiếp theo cho player ('X' hoặc 'O') trên board hiện tại.
-    Sử dụng BFS có điều kiện với parallel queries.
-    Trả về (i, j) 1-indexed của nước đi tốt nhất.
-    """
-    start_time = time.time()
-    total_queries = 0
-    total_bytes = 0
-    
-    # Clear cache nếu quá lớn
-    global QUERY_CACHE
-    if len(QUERY_CACHE) > MAX_CACHE_SIZE:
-        QUERY_CACHE.clear()
-    
-    # === Canonical hóa board trước khi xử lý ===
-    canonical_board = board.canonical_form()
-    transform_map = get_transform_mapping(board, canonical_board)
-    
-    boards_by_layer = {}
-    opponent = 'O' if player == 'X' else 'X'
-    
-    # === Layer 0: Nước đi đầu tiên ===
-    curr_layer = canonical_board.layer + 1
-    curr_player = 'X' if (curr_layer % 2) == 1 else 'O'
-    
-    if curr_player != player:
-        print(f"Cảnh báo: Không phải lượt của {player}")
-        return None
-    
-    unique_moves = get_unique_moves(canonical_board, curr_player)
-    
-    if not unique_moves:
-        return None
-    
-    boards_by_layer[0] = []
-    
-    if canonical_board.layer < 9:  # Chưa cần query DB
-        for move in unique_moves:
-            new_board = Board(copy.deepcopy(canonical_board.positions), canonical_board.size, curr_layer)
-            new_board.add_pos(Position(move[0], move[1], curr_player))
-            
-            winner = new_board.check_win()
-            if winner == player:
-                original_move = reverse_transform(move, transform_map, board.size)
-                return original_move
-            
-            boards_by_layer[0].append((new_board, move))
-    else:
-        # ✅ PARALLEL QUERIES cho layer 0
-        base_condition = [{'i': pos.i, 'j': pos.j} for pos in canonical_board.positions]
-        
-        conditions_list = []
-        for move in unique_moves:
-            condition = base_condition.copy()
-            condition.append({'i': move[0], 'j': move[1]})
-            conditions_list.append(condition)
-        
-        # Query tất cả song song
-        all_results = batch_query_parallel(
-            f"ttt_{canonical_board.size}_l{curr_layer}",
-            conditions_list,
-            max_workers=30
+    try:
+        response = session.post(
+            CLICKHOUSE_HTTP,
+            params={
+                "user": CLICKHOUSE_USER,
+                "password": CLICKHOUSE_PASS,
+                "database": DATABASE
+            },
+            data=sql,
+            timeout=10
         )
         
-        total_queries += len(conditions_list)
+        if response.status_code != 200:
+            print(f"❌ Query error {response.status_code}: {response.text}")
+            return 0
         
-        # Process results
-        for move, data in zip(unique_moves, all_results):
-            if not data:
-                continue
-            
-            total_bytes += len(str(data))
-            
-            for row in data:
-                result_board = data_to_board_light(row, canonical_board.size, curr_layer)
-                
-                if result_board.win_actor == player:
-                    original_move = reverse_transform(move, transform_map, board.size)
-                    elapsed = time.time() - start_time
-                    speed_mb_s = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
-                    print(f"⚡ Stats: {total_queries} queries, {elapsed:.2f}s, {speed_mb_s:.1f} MB/s")
-                    return original_move
-                
-                if result_board.win_actor != opponent:
-                    boards_by_layer[0].append((result_board, move))
+        result = response.text.strip()
+        if not result:
+            return 0
+        
+        return int(result)
+        
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        return 0
+
+
+def get_odd_table_names(move_count: int) -> str:
+    """
+    Lấy danh sách tên bảng odd (lượt lẻ)
     
-    # Adaptive depth
-    if board.layer < 5:
-        max_depth = 8
-    elif board.layer < 15:
-        max_depth = 10
+    Args:
+        move_count: Số nước đã đi (không dùng, chỉ để giữ signature)
+        
+    Returns:
+        String format SQL: ttt_5_l9, ttt_5_l11, ..., ttt_5_l25
+    """
+    tables = []
+    
+    # Lấy tất cả các level lẻ từ 9 đến 25
+    for level in range(9, 26, 2):  # 9, 11, 13, ..., 25
+        tables.append(f"ttt_5_l{level}")
+    
+    return ", ".join(tables)
+
+
+def get_even_table_names(move_count: int) -> str:
+    """
+    Lấy danh sách tên bảng even (lượt chẵn)
+    
+    Args:
+        move_count: Số nước đã đi (không dùng, chỉ để giữ signature)
+        
+    Returns:
+        String format SQL: ttt_5_l10, ttt_5_l12, ..., ttt_5_l24
+    """
+    tables = []
+    
+    # Lấy tất cả các level chẵn từ 10 đến 24
+    for level in range(10, 25, 2):  # 10, 12, 14, ..., 24
+        tables.append(f"ttt_5_l{level}")
+    
+    return ", ".join(tables)
+
+
+def build_where_clause(board: list) -> str:
+    """
+    Xây dựng WHERE clause từ board
+    
+    Args:
+        board: Board hiện tại
+        
+    Returns:
+        WHERE clause string
+    """
+    n = 5
+    conditions = []
+    
+    for idx, cell in enumerate(board):
+        if cell != 0:
+            row = (idx // n) + 1  # +1 vì index bắt đầu từ 1
+            col = (idx % n) + 1
+            col_name = f"i{row}{col}"
+            player_mark = 'X' if cell == 1 else 'O'
+            conditions.append(f"{col_name} = '{player_mark}'")
+    
+    return " AND ".join(conditions) if conditions else "1=1"
+
+
+def query_odd_table(board: list) -> int:
+    """
+    Query bảng odd (lượt lẻ) - đếm số trận X thắng
+    
+    Args:
+        board: Bảng hiện tại (list of int, size 25)
+        
+    Returns:
+        Số lượng rows có win_actor = 'X'
+    """
+    move_count = sum(1 for cell in board if cell != 0)
+    
+    if move_count == 0:
+        return 0
+    
+    where_clause = build_where_clause(board)
+    
+    # Tạo UNION ALL cho tất cả bảng lẻ
+    union_queries = []
+    for level in range(9, 26, 2):  # 9, 11, 13, ..., 25
+        if level < move_count:
+            continue
+        table_name = f"ttt_5_l{level}"
+        union_queries.append(f"SELECT COUNT(*) FROM {table_name} WHERE {where_clause} AND win_actor = 'X'")
+
+    # Kết hợp và tính tổng
+    sql = f"SELECT sum(c) FROM ({' UNION ALL '.join(union_queries)}) AS counts(c)"
+    
+    return execute_query(sql)
+
+
+def query_even_table(board: list) -> int:
+    """
+    Query bảng even (lượt chẵn) - đếm số trận O thắng
+    
+    Args:
+        board: Bảng hiện tại (list of int, size 25)
+        
+    Returns:
+        Số lượng rows có win_actor = 'O'
+    """
+    move_count = sum(1 for cell in board if cell != 0)
+    
+    if move_count == 0:
+        return 0
+    
+    where_clause = build_where_clause(board)
+    
+    # Tạo UNION ALL cho tất cả bảng chẵn
+    union_queries = []
+    for level in range(10, 25, 2):  # 10, 12, 14, ..., 24
+        if level < move_count:
+            continue
+        table_name = f"ttt_5_l{level}"
+        union_queries.append(f"SELECT COUNT(*) FROM {table_name} WHERE {where_clause} AND win_actor = 'O'")
+    
+    # Kết hợp và tính tổng
+    sql = f"SELECT sum(c) FROM ({' UNION ALL '.join(union_queries)}) AS counts(c)"
+    
+    return execute_query(sql)
+
+#=========================================Symmetric==========================================
+N = 5  # Board size constant
+
+# Transformation functions
+def t_identity(r, c):
+    return (r, c)
+
+def t_rot90(r, c):
+    return (c, N-1-r)
+
+def t_rot180(r, c):
+    return (N-1-r, N-1-c)
+
+def t_rot270(r, c):
+    return (N-1-c, r)
+
+def t_reflect_h(r, c):
+    return (N-1-r, c)
+
+def t_reflect_v(r, c):
+    return (r, N-1-c)
+
+def t_reflect_main(r, c):
+    return (c, r)
+
+def t_reflect_anti(r, c):
+    return (N-1-c, N-1-r)
+
+
+def apply_transformation(board: list, transform_func) -> list:
+    """
+    Áp dụng transformation function lên board
+    
+    Args:
+        board: Board 1D (25 elements)
+        transform_func: Hàm transformation (r,c) -> (r',c')
+        
+    Returns:
+        Board mới sau khi transform
+    """
+    n = N
+    new_board = [0] * (n * n)
+    
+    for idx in range(n * n):
+        r = idx // n
+        c = idx % n
+        
+        # Apply transformation
+        new_r, new_c = transform_func(r, c)
+        new_idx = new_r * n + new_c
+        
+        new_board[new_idx] = board[idx]
+    
+    return new_board
+
+
+def get_symmetries(board: list) -> list:
+    """
+    Tạo tất cả các phép biến đổi đối xứng của board 5x5
+    Dùng cùng transformations như lúc gen data
+    
+    Args:
+        board: Board hiện tại (list 25 elements)
+        
+    Returns:
+        List các board đối xứng (8 biến đổi)
+    """
+    transformations = [
+        t_identity,
+        t_rot90,
+        t_rot180,
+        t_rot270,
+        t_reflect_h,
+        t_reflect_v,
+        t_reflect_main,
+        t_reflect_anti
+    ]
+    
+    symmetries = []
+    for transform in transformations:
+        sym_board = apply_transformation(board, transform)
+        symmetries.append(sym_board)
+    
+    return symmetries
+
+
+def canonical_board(board: list) -> list:
+    """
+    Tìm canonical form của board (form nhỏ nhất theo lexicographic order)
+    Giống như lúc gen data
+    
+    Args:
+        board: Board hiện tại
+        
+    Returns:
+        Canonical board
+    """
+    symmetries = get_symmetries(board)
+    
+    # Convert to tuples for comparison
+    sym_tuples = [tuple(sym) for sym in symmetries]
+    
+    # Return the lexicographically smallest
+    return list(min(sym_tuples))
+
+#==========================================AI Logic==========================================
+def best_step(currBoard: list, player: int):
+    """
+    Tìm nước đi tốt nhất cho AI dựa trên database
+    
+    Args:
+        currBoard: Board hiện tại
+        player: Player hiện tại (1 hoặc 2)
+        
+    Returns:
+        Index của nước đi tốt nhất, hoặc -1 nếu không tìm thấy
+    """
+    start_time = time.time()
+
+    best_move = -1
+    win_rate = 0
+    
+    # Log số ô trống
+    empty_cells = sum(1 for cell in currBoard if cell == 0)
+    print(f"\n🤔 AI đang suy nghĩ... (Còn {empty_cells} ô trống)")
+    
+    moves_checked = 0
+    moves_with_data = 0
+
+    for i in range(len(currBoard)):
+        if currBoard[i] != 0:
+            continue
+
+        moves_checked += 1
+        newBoard = copy.deepcopy(currBoard)
+        newBoard[i] = player
+
+        # Convert to canonical form trước khi query
+        canonical = canonical_board(newBoard)
+        
+        # Query với canonical form
+        x_win_count = query_odd_table(canonical)
+        o_win_count = query_even_table(canonical)
+        total_count = x_win_count + o_win_count
+        
+        if total_count <= 0:
+            continue
+        
+        moves_with_data += 1
+        
+        # Tính win rate cho player hiện tại
+        win_count = x_win_count if player == 1 else o_win_count
+        current_win_rate = win_count / total_count
+        
+        # Log chi tiết
+        row = i // 5
+        col = i % 5
+        print(f"  Ô [{row},{col}] (idx={i}): win_rate={current_win_rate:.2%} "
+              f"(X:{x_win_count}, O:{o_win_count}, total:{total_count})")
+        
+        if current_win_rate > win_rate:
+            win_rate = current_win_rate
+            best_move = i
+
+    elapsed_time = time.time() - start_time
+    
+    if best_move != -1:
+        print(f"\n✅ AI chọn ô {best_move} (row={best_move//5}, col={best_move%5})")
+        print(f"   Win rate: {win_rate:.2%}")
     else:
-        max_depth = 16
+        print(f"\n⚠️  Không tìm thấy nước đi tốt trong database")
+        # Fallback: chọn ô trống đầu tiên
+        for i in range(len(currBoard)):
+            if currBoard[i] == 0:
+                best_move = i
+                break
+        if best_move != -1:
+            print(f"   Chọn random: ô {best_move} (row={best_move//5}, col={best_move%5})")
     
-    # === BFS với parallel queries và pruning ===
-    for layer_offset in range(1, min(max_depth, 26 - canonical_board.layer)):
-        curr_layer = canonical_board.layer + layer_offset + 1
-        curr_player = 'X' if (curr_layer % 2) == 1 else 'O'
-        is_player_turn = (curr_player == player)
-        
-        boards_by_layer[layer_offset] = []
-        prev_layer_boards = boards_by_layer.get(layer_offset - 1, [])
-        
-        if not prev_layer_boards:
-            break
-        
-        # ✅ Pruning: chỉ giữ top boards
-        if len(prev_layer_boards) > 50:
-            prev_layer_boards = sorted(
-                prev_layer_boards,
-                key=lambda x: get_board_score(x[0], player),
-                reverse=True
-            )[:50]
-        
-        # Collect all queries
-        all_conditions = []
-        query_metadata = []
-        
-        for prev_board, first_move_tuple in prev_layer_boards:
-            if prev_board.layer < 9:
-                unique_moves = get_unique_moves(prev_board, curr_player)
-                for move in unique_moves:
-                    new_board = Board(copy.deepcopy(prev_board.positions), canonical_board.size, curr_layer)
-                    new_board.add_pos(Position(move[0], move[1], curr_player))
-                    
-                    winner = new_board.check_win()
-                    
-                    if is_player_turn and winner == player:
-                        original_move = reverse_transform(first_move_tuple, transform_map, board.size)
-                        elapsed = time.time() - start_time
-                        speed_mb_s = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
-                        print(f"⚡ Stats: {total_queries} queries, {elapsed:.2f}s, {speed_mb_s:.1f} MB/s")
-                        return original_move
-                    
-                    if winner != opponent:
-                        boards_by_layer[layer_offset].append((new_board, first_move_tuple))
+    print(f"⏱️  Thời gian suy nghĩ: {elapsed_time:.3f}s")
+    
+    return best_move
+
+#==========================================Game Logic==========================================
+def print_board(board: list):
+    """In bảng game ra console"""
+    n = int(len(board) ** 0.5)
+    print("\n  " + "   ".join([str(i) for i in range(n)]))
+    print("  " + "----" * n)
+    
+    for i in range(n):
+        row = []
+        for j in range(n):
+            idx = i * n + j
+            cell = board[idx]
+            if cell == 0:
+                row.append(" ")
+            elif cell == 1:
+                row.append("X")
             else:
-                base_condition = [{'i': pos.i, 'j': pos.j} for pos in prev_board.positions]
-                unique_moves = get_unique_moves(prev_board, curr_player)
-                
-                for move in unique_moves:
-                    condition = base_condition.copy()
-                    condition.append({'i': move[0], 'j': move[1]})
-                    all_conditions.append(condition)
-                    query_metadata.append((prev_board, first_move_tuple, move))
-        
-        # ✅ Query tất cả song song
-        if all_conditions:
-            all_results = batch_query_parallel(
-                f"ttt_{canonical_board.size}_l{curr_layer}",
-                all_conditions,
-                max_workers=30
-            )
-            
-            total_queries += len(all_conditions)
-            
-            # Process results
-            for (prev_board, first_move_tuple, move), data in zip(query_metadata, all_results):
-                if not data:
-                    continue
-                
-                total_bytes += len(str(data))
-                
-                for row in data:
-                    result_board = data_to_board_light(row, canonical_board.size, curr_layer)
-                    
-                    if is_player_turn:
-                        if result_board.win_actor == player:
-                            original_move = reverse_transform(first_move_tuple, transform_map, board.size)
-                            elapsed = time.time() - start_time
-                            speed_mb_s = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
-                            print(f"⚡ Stats: {total_queries} queries, {elapsed:.2f}s, {speed_mb_s:.1f} MB/s")
-                            return original_move
-                        
-                        if result_board.win_actor != opponent:
-                            boards_by_layer[layer_offset].append((result_board, first_move_tuple))
-                    else:
-                        if result_board.win_actor != opponent:
-                            boards_by_layer[layer_offset].append((result_board, first_move_tuple))
-    
-    # Fallback
-    elapsed = time.time() - start_time
-    speed_mb_s = (total_bytes / 1024 / 1024) / elapsed if elapsed > 0 else 0
-    print(f"⚡ Stats: {total_queries} queries, {elapsed:.2f}s, {speed_mb_s:.1f} MB/s")
-    
-    if boards_by_layer.get(0):
-        canonical_move = boards_by_layer[0][0][1]
-        original_move = reverse_transform(canonical_move, transform_map, board.size)
-        return original_move
-    
-    if unique_moves:
-        canonical_move = unique_moves[0]
-        original_move = reverse_transform(canonical_move, transform_map, board.size)
-        return original_move
-    
-    return None
+                row.append("O")
+        print(f"{i}| {' | '.join(row)} |")
+        if i < n - 1:
+            print("  " + "----" * n)
+    print()
 
-#=======================================data to board========================================
-def data_to_board_light(row: list, size: int = 5, layer: int = 0) -> Board:
+
+def check_winner(board: list) -> int:
     """
-    Parse board nhẹ - CHỈ lấy canonical_form và win_actor
-    Không parse 25 cells vì không cần thiết
+    Kiểm tra người thắng
+    
+    Returns:
+        0: chưa có người thắng
+        1: player 1 (X) thắng
+        2: player 2 (O) thắng
+        -1: hòa
     """
-    if not row or len(row) < 2:
-        raise ValueError("Row data không hợp lệ")
+    n = int(len(board) ** 0.5)
     
-    canonical_form = row[0].strip()
-    win_actor = row[1].strip()
+    # Kiểm tra hàng ngang
+    for i in range(n):
+        for j in range(n - 4):
+            if board[i*n + j] != 0:
+                if all(board[i*n + j + k] == board[i*n + j] for k in range(5)):
+                    return board[i*n + j]
     
-    # Trả về board minimal
-    board = Board([], size, layer, win_actor)
-    board._canonical_form = canonical_form
+    # Kiểm tra hàng dọc
+    for i in range(n - 4):
+        for j in range(n):
+            if board[i*n + j] != 0:
+                if all(board[(i+k)*n + j] == board[i*n + j] for k in range(5)):
+                    return board[i*n + j]
     
-    return board
+    # Kiểm tra đường chéo chính
+    for i in range(n - 4):
+        for j in range(n - 4):
+            if board[i*n + j] != 0:
+                if all(board[(i+k)*n + (j+k)] == board[i*n + j] for k in range(5)):
+                    return board[i*n + j]
+    
+    # Kiểm tra đường chéo phụ
+    for i in range(n - 4):
+        for j in range(4, n):
+            if board[i*n + j] != 0:
+                if all(board[(i+k)*n + (j-k)] == board[i*n + j] for k in range(5)):
+                    return board[i*n + j]
+    
+    # Kiểm tra hòa
+    if all(cell != 0 for cell in board):
+        return -1
+    
+    return 0
 
 
-def data_to_board(row: list, size: int = 5, layer: int = 0) -> Board:
-    """
-    Chuyển đổi một row từ ClickHouse thành Board object đầy đủ.
-    Dùng khi cần positions.
-    """
-    if not row or len(row) < 2:
-        raise ValueError("Row data không hợp lệ")
-    
-    # Index 0: canonical_form
-    # Index 1: win_actor
-    win_actor = row[1].strip() if len(row) > 1 else ''
-    
-    # Parse positions từ i11, i12, ..., i55
-    positions = []
-    cell_index = 2
-    
-    for i in range(1, size + 1):
-        for j in range(1, size + 1):
-            if cell_index < len(row):
-                val = row[cell_index].strip()
-                if val and val != '' and val != '.':
-                    positions.append(Position(i, j, val))
-            cell_index += 1
-    
-    if layer == 0:
-        layer = len(positions)
-    
-    return Board(positions, size, layer, win_actor)
-
-#========================================unique move=========================================
-def get_unique_moves(board: Board, player: str) -> list:
-    """
-    Trả về danh sách các nước đi duy nhất (i, j) 1-indexed cho player trên board hiện tại,
-    áp dụng tối ưu hóa đối xứng.
-    """
-    size = board.size
-    unique_moves = {}
-
-    for i in range(size):
-        for j in range(size):
-            if board.board[i, j] == '.':
-                # Thử đặt player tại ô (i,j)
-                board.board[i, j] = player
-                # Tính canonical form sau nước đi
-                canon_board = board.canonical_form()
-                # Chuyển board thành string để làm key
-                canon_string = ''.join(canon_board.board.flatten())
-                # Lưu vào dict: chỉ giữ một move cho mỗi canonical form
-                if canon_string not in unique_moves:
-                    unique_moves[canon_string] = (i+1, j+1)  # 1-indexed
-                # Reset ô
-                board.board[i, j] = '.'
-
-    return list(unique_moves.values())
-
-#==========================================Game Play=========================================
 def play_game():
-    """
-    Chơi game Tic-Tac-Toe 5x5
-    """
-    print("=== TIC-TAC-TOE 5x5 ===")
-    print("Chọn chế độ:")
-    print("1. Người vs Người")
-    print("2. Người vs AI")
-    print("3. AI vs AI")
+    """Main game loop"""
+    board = [0] * 25  # 5x5 board
+    current_player = 1  # 1 = X (Human), 2 = O (AI)
     
-    mode = input("Nhập lựa chọn (1/2/3): ").strip()
+    print("=" * 50)
+    print("🎮 TIC-TAC-TOE 5x5 - AI vs HUMAN 🎮")
+    print("=" * 50)
+    print("Bạn là X, AI là O")
+    print("Nhiệm vụ: Tạo 5 dấu liên tiếp (ngang/dọc/chéo)")
+    print("=" * 50)
     
-    board = Board([], size=5, layer=0)
-    current_player = 'X'
+    move_count = 0
     
     while True:
-        print("\n" + "="*30)
-        print(board)
-        print(f"Lượt: {current_player}")
+        print_board(board)
         
-        # Kiểm tra thắng
-        winner = board.check_win()
-        if winner:
-            print(f"\n🎉 {winner} THẮNG! 🎉")
-            break
-        
-        # Kiểm tra hòa
-        if board.is_full():
-            print("\n🤝 HÒA! 🤝")
-            break
-        
-        # Lấy nước đi
-        if mode == '1':  # Người vs Người
-            move = get_human_move(board)
-        elif mode == '2':  # Người vs AI
-            if current_player == 'X':
-                move = get_human_move(board)
+        winner = check_winner(board)
+        if winner != 0:
+            if winner == 1:
+                print("🎉 Bạn thắng! Chúc mừng!")
+            elif winner == 2:
+                print("🤖 AI thắng! Hãy thử lại!")
             else:
-                print("AI đang suy nghĩ...")
-                move = next_best_move(board, current_player)
-                if move:
-                    print(f"AI chọn: ({move[0]}, {move[1]})")
-        else:  # AI vs AI
-            print(f"AI {current_player} đang suy nghĩ...")
-            move = next_best_move(board, current_player)
-            if move:
-                print(f"AI {current_player} chọn: ({move[0]}, {move[1]})")
-            input("Nhấn Enter để tiếp tục...")
-        
-        if not move:
-            print("Không có nước đi hợp lệ!")
+                print("🤝 Hòa!")
             break
         
-        # Thực hiện nước đi
-        board.add_pos(Position(move[0], move[1], current_player))
-        
-        # Đổi lượt
-        current_player = 'O' if current_player == 'X' else 'X'
-    
-    print("\n" + "="*30)
-    print("Game Over!")
-
-def get_human_move(board: Board) -> tuple:
-    """Lấy nước đi từ người chơi"""
-    while True:
-        try:
-            move_input = input("Nhập nước đi (i j): ").strip()
-            i, j = map(int, move_input.split())
+        if current_player == 1:
+            # Human turn
+            print(f"\n--- Lượt của bạn (X) - Nước đi #{move_count + 1} ---")
+            while True:
+                try:
+                    row = int(input("Nhập hàng (0-4): "))
+                    col = int(input("Nhập cột (0-4): "))
+                    idx = row * 5 + col
+                    
+                    if row < 0 or row > 4 or col < 0 or col > 4:
+                        print("❌ Vị trí không hợp lệ! Hãy nhập 0-4")
+                        continue
+                    
+                    if board[idx] != 0:
+                        print("❌ Ô này đã được đánh! Chọn ô khác")
+                        continue
+                    
+                    board[idx] = 1
+                    break
+                except ValueError:
+                    print("❌ Vui lòng nhập số!")
+                except KeyboardInterrupt:
+                    print("\n👋 Tạm biệt!")
+                    return
+        else:
+            # AI turn
+            print(f"\n--- Lượt của AI (O) - Nước đi #{move_count + 1} ---")
+            move = best_step(board, 2)
             
-            if 1 <= i <= board.size and 1 <= j <= board.size:
-                if board.board[i-1, j-1] == '.':
-                    return (i, j)
-                else:
-                    print("Ô này đã có quân cờ!")
-            else:
-                print(f"Vui lòng nhập trong khoảng 1-{board.size}!")
-        except:
-            print("Định dạng không hợp lệ! Nhập: i j (VD: 3 3)")
+            if move == -1:
+                print("❌ AI không thể di chuyển!")
+                break
+            
+            board[move] = 2
+        
+        current_player = 3 - current_player  # Switch: 1 <-> 2
+        move_count += 1
+        
+        # Pause để dễ theo dõi
+        if current_player == 1:
+            input("\nNhấn Enter để tiếp tục...")
 
-#============================================Main============================================
+
+def play_ai_vs_ai():
+    """AI vs AI mode để test"""
+    board = [0] * 25
+    current_player = 1
+    
+    print("=" * 50)
+    print("🤖 TIC-TAC-TOE 5x5 - AI vs AI 🤖")
+    print("=" * 50)
+    
+    move_count = 0
+    
+    while True:
+        print_board(board)
+        
+        winner = check_winner(board)
+        if winner != 0:
+            if winner == 1:
+                print("🎉 AI X thắng!")
+            elif winner == 2:
+                print("🤖 AI O thắng!")
+            else:
+                print("🤝 Hòa!")
+            break
+        
+        print(f"\n--- Lượt của AI {'X' if current_player == 1 else 'O'} - Nước đi #{move_count + 1} ---")
+        move = best_step(board, current_player)
+        
+        if move == -1:
+            print("❌ AI không thể di chuyển!")
+            break
+        
+        board[move] = current_player
+        current_player = 3 - current_player
+        move_count += 1
+        
+        time.sleep(1)  # Pause để xem
+
+
 if __name__ == "__main__":
-    # Test canonical transformation
-    print("=== Test Canonical Transformation ===")
-    positions = [Position(1, 1, 'X'), Position(5, 5, 'O')]
-    board = Board(positions, size=5, layer=2)
+    print("\n🎮 Chọn chế độ chơi:")
+    print("1. Human vs AI")
+    print("2. AI vs AI (test mode)")
     
-    print("Original board:")
-    print(board)
-    
-    canonical = board.canonical_form()
-    print("Canonical board:")
-    print(canonical)
-    
-    transform_map = get_transform_mapping(board, canonical)
-    print(f"Transform map: {transform_map}")
-    
-    # Test reverse transform
-    test_pos = (3, 3)
-    original_pos = reverse_transform(test_pos, transform_map, 5)
-    print(f"Canonical pos {test_pos} -> Original pos {original_pos}")
-    
-    print("\n" + "="*50 + "\n")
-    
-    # Chơi game
-    play_game()
+    try:
+        choice = input("\nNhập lựa chọn (1 hoặc 2): ").strip()
+        
+        if choice == "1":
+            play_game()
+        elif choice == "2":
+            play_ai_vs_ai()
+        else:
+            print("❌ Lựa chọn không hợp lệ!")
+    except KeyboardInterrupt:
+        print("\n👋 Tạm biệt!")
